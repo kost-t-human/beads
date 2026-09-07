@@ -20,6 +20,11 @@ type DoltServerDSN struct {
 	TLSKey          string
 	TLSConfigName   string
 	ClientFoundRows bool
+	// InterpolateParams makes the driver inline query arguments client-side
+	// instead of PREPARE + EXECUTE, halving round trips per parameterized
+	// statement. Safe for utf8mb4 (the driver rejects the multibyte charsets
+	// where interpolation would be unsafe).
+	InterpolateParams bool
 }
 
 func (d DoltServerDSN) String() string {
@@ -46,6 +51,7 @@ func (d DoltServerDSN) String() string {
 		Timeout:              timeout,
 		AllowNativePasswords: true,
 		ClientFoundRows:      d.ClientFoundRows,
+		InterpolateParams:    d.InterpolateParams,
 	}
 	switch {
 	case d.TLSConfigName != "":

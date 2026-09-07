@@ -50,3 +50,18 @@ func isDatabaseExistsError(err error) bool {
 	errLower := strings.ToLower(err.Error())
 	return strings.Contains(errLower, "database exists") || strings.Contains(errLower, "1007")
 }
+
+// isUnknownDatabaseError reports whether err is the server refusing a
+// connection or USE because the named database does not exist (MySQL 1049,
+// ER_BAD_DB_ERROR).
+func isUnknownDatabaseError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1049 {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	errLower := strings.ToLower(err.Error())
+	return strings.Contains(errLower, "database not found") || strings.Contains(errLower, "unknown database") || strings.Contains(errLower, "1049")
+}

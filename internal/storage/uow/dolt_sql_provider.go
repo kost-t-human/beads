@@ -40,6 +40,10 @@ type doltSQLProvider struct {
 	// non-mutating preview (--dry-run, --inspect). The open creates no
 	// database and applies no migration; see providerOptions.preview.
 	preview bool
+	// dbSelected: the pool's DSN already names the target database, so every
+	// pinned connection starts with it selected and initSchema may skip the
+	// USE round trip.
+	dbSelected bool
 }
 
 type bootstrapPreparationError struct {
@@ -225,25 +229,19 @@ func (p *doltSQLProvider) initSchema(ctx context.Context, database string) error
 
 		ddl := db.NewDDLSQLRepository(conn)
 		if p.teamServer {
-			if err := ddl.UseDatabase(ctx, database); err != nil {
-				if isSerializationError(err) {
-					return fmt.Errorf("uow: switching to database: %w", err)
+			if !p.dbSelected {
+				if err := ddl.UseDatabase(ctx, database); err != nil {
+					if isSerializationError(err) {
+						return fmt.Errorf("uow: switching to database: %w", err)
+					}
+					return backoff.Permanent(fmt.Errorf(
+						"uow: database %q not found — the schema is managed by beads-team-server; ask your operator to run 'bts init' first: %w",
+						database, err))
 				}
-				return backoff.Permanent(fmt.Errorf(
-					"uow: database %q not found — the schema is managed by beads-team-server; ask your operator to run 'bts init' first: %w",
-					database, err))
 			}
-			if err := checkTeamServerSchema(ctx, conn, database); err != nil {
+			if err := checkTeamServerSchemaAndIdentity(ctx, conn, database, p.expectedProjectID); err != nil {
 				if isSerializationError(err) {
-					return fmt.Errorf("uow: team-server schema check: %w", err)
-				}
-				return backoff.Permanent(err)
-			}
-			// Identity is checked only after the schema check proves the
-			// metadata table exists at this binary's version.
-			if err := checkTeamServerIdentity(ctx, conn, database, p.expectedProjectID); err != nil {
-				if isSerializationError(err) {
-					return fmt.Errorf("uow: team-server identity check: %w", err)
+					return fmt.Errorf("uow: team-server check: %w", err)
 				}
 				return backoff.Permanent(err)
 			}
@@ -254,6 +252,9 @@ func (p *doltSQLProvider) initSchema(ctx context.Context, database string) error
 			// stop. No CreateDatabase, no MigrateUpWithLock — a --dry-run or
 			// --inspect that migrated the workspace before rendering its plan
 			// would be the exact side effect the flag exists to prevent.
+			if p.dbSelected {
+				return nil
+			}
 			if err := ddl.UseDatabase(ctx, database); err != nil {
 				if isSerializationError(err) {
 					return fmt.Errorf("uow: switching to database: %w", err)
@@ -274,47 +275,80 @@ func (p *doltSQLProvider) initSchema(ctx context.Context, database string) error
 
 func buildDSN(ep proxy.Endpoint, database, user, password, tlsConfigName string) string {
 	return util.DoltServerDSN{
-		Host:            ep.Host,
-		Port:            ep.Port,
-		User:            user,
-		Password:        password,
-		Database:        database,
-		TLSConfigName:   tlsConfigName,
-		ClientFoundRows: true,
+		Host:              ep.Host,
+		Port:              ep.Port,
+		User:              user,
+		Password:          password,
+		Database:          database,
+		TLSConfigName:     tlsConfigName,
+		ClientFoundRows:   true,
+		InterpolateParams: true,
 	}.String()
 }
 
+// openDB opens a pool and establishes its first connection so that a dead
+// server, bad credentials or a missing database surface here rather than on
+// the first query. The connection returns to the pool for reuse; no extra
+// COM_PING round trip is spent, the handshake itself is the liveness proof.
 func openDB(ctx context.Context, dsn string) (*sql.DB, error) {
-	conn, err := sql.Open("mysql", dsn)
+	pool, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("uow: open db: %w", err)
 	}
-	if err := conn.PingContext(ctx); err != nil {
-		return nil, errors.Join(fmt.Errorf("uow: ping db: %w", err), conn.Close())
+	conn, err := pool.Conn(ctx)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("uow: connect db: %w", err), pool.Close())
 	}
-	return conn, nil
+	if err := conn.Close(); err != nil {
+		return nil, errors.Join(fmt.Errorf("uow: release db conn: %w", err), pool.Close())
+	}
+	return pool, nil
 }
 
+// openAndInitSchema opens ONE pool bound to the target database, runs the
+// schema/identity probe on it and hands that same pool to the provider. The
+// old two-pool dance (probe on a database-less pool, close, reopen with the
+// database) cost a second TCP+TLS+auth handshake and a USE on every bd
+// invocation. The database-less path survives only as the fallback for a
+// database that does not exist yet: connecting with it named fails with 1049,
+// and bootstrap (CREATE DATABASE + migrate) needs a session that is not
+// pinned to it.
 func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUser, rootPassword, tlsConfigName string, teamServer bool, expectedProjectID string, opts providerOptions) (UnitOfWorkProvider, error) {
+	newProvider := func(pool *sql.DB, dbSelected bool) *doltSQLProvider {
+		return &doltSQLProvider{
+			defaultBranch:     defaultBranch,
+			db:                pool,
+			serverEndpoint:    "tcp:" + ep.Address(),
+			teamServer:        teamServer,
+			expectedProjectID: expectedProjectID,
+			preview:           opts.preview,
+			dbSelected:        dbSelected,
+		}
+	}
+
+	pool, err := openDB(ctx, buildDSN(ep, database, rootUser, rootPassword, tlsConfigName))
+	switch {
+	case err == nil:
+		provider := newProvider(pool, true)
+		if err := provider.initSchema(ctx, database); err != nil {
+			_ = pool.Close()
+			return nil, fmt.Errorf("uow: init schema: %w", err)
+		}
+		return provider, nil
+	case !isUnknownDatabaseError(err):
+		return nil, err
+	}
+
+	// Database missing: bootstrap through a database-less session, then
+	// reopen bound to the database it created.
 	initDB, err := openDB(ctx, buildDSN(ep, "", rootUser, rootPassword, tlsConfigName))
 	if err != nil {
 		return nil, err
 	}
-
-	initProvider := &doltSQLProvider{
-		defaultBranch:     defaultBranch,
-		db:                initDB,
-		serverEndpoint:    "tcp:" + ep.Address(),
-		teamServer:        teamServer,
-		expectedProjectID: expectedProjectID,
-		preview:           opts.preview,
-	}
-
-	if err := initProvider.initSchema(ctx, database); err != nil {
+	if err := newProvider(initDB, false).initSchema(ctx, database); err != nil {
 		_ = initDB.Close()
 		return nil, fmt.Errorf("uow: init schema: %w", err)
 	}
-
 	if err := initDB.Close(); err != nil {
 		return nil, fmt.Errorf("uow: close init db: %w", err)
 	}
@@ -323,13 +357,5 @@ func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUse
 	if err != nil {
 		return nil, err
 	}
-
-	return &doltSQLProvider{
-		defaultBranch:     defaultBranch,
-		db:                dbConn,
-		serverEndpoint:    "tcp:" + ep.Address(),
-		teamServer:        teamServer,
-		expectedProjectID: expectedProjectID,
-		preview:           opts.preview,
-	}, nil
+	return newProvider(dbConn, true), nil
 }
